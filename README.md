@@ -93,7 +93,8 @@ Alternatively, import a Cursor API key credential into CPA:
 ## Use
 
 Get model IDs from CPA's `/v1/models` and select a `cursor/…` model in your client.
-Browser tokens require signing in again after expiry. Per-account proxy overrides are currently unsupported.
+Browser logins renew their access token through CPA's credential refresh about a day before it expires;
+sign in again only if Cursor ends the session. Per-account proxy overrides are currently unsupported.
 
 ## Development
 
