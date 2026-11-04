@@ -24,6 +24,9 @@ type credential struct {
 	Key       string `json:"key,omitempty"`
 	AccountID string `json:"accountId,omitempty"`
 	Plan      string `json:"plan,omitempty"`
+	// RefreshStopped preserves the current token after an unusable renewal. It is
+	// persisted so restarting CPA cannot retry the rejected renewal automatically.
+	RefreshStopped bool `json:"refreshStopped,omitempty"`
 }
 type keyCache struct {
 	Token   string
@@ -99,7 +102,18 @@ func authRecord(auth credential, name, label string, extra map[string]any) map[s
 	if label == "" {
 		label = "Cursor"
 	}
-	return map[string]any{"Provider": "cursor", "ID": "cursor-" + identity, "FileName": name, "Label": label, "StorageJSON": encodeJSON(stored), "Metadata": stored}
+	record := map[string]any{"Provider": "cursor", "ID": "cursor-" + identity, "FileName": name, "Label": label, "StorageJSON": encodeJSON(stored), "Metadata": stored}
+	record["Disabled"] = stored["disabled"] == true
+	if renewable(auth) {
+		// CPA's refresh loop calls auth.refresh only for credentials that name an interval;
+		// refreshAuth itself contacts Cursor only within refreshLead of the token's expiry.
+		record["Attributes"] = map[string]string{"refresh_interval_seconds": "3600"}
+	} else if auth.RefreshStopped {
+		// Explicitly replace the host's previous interval; omitted attributes are
+		// inherited during refresh. The persisted flag also guards direct calls.
+		record["Attributes"] = map[string]string{"refresh_interval_seconds": "0"}
+	}
+	return record
 }
 func (p *pluginRuntime) parseAuth(req rpcRequest) (any, error) {
 	stored, err := jsonObject(req.RawJSON)
@@ -171,21 +185,91 @@ func (p *pluginRuntime) token(s *requestScope, req rpcRequest) (string, error) {
 	}
 	return auth.Access, nil
 }
+
+// cursorClientID is the OAuth client Cursor's IDE and CLI renew their login sessions with.
+const cursorClientID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
+
+// refreshLead renews a browser session this long before its access token expires.
+const refreshLead = 24 * time.Hour
+
+// renewable reports whether a credential holds a refresh token issued by browser login.
+func renewable(auth credential) bool {
+	return auth.Type == "oauth" && !auth.RefreshStopped && auth.Refresh != "" && auth.Refresh != "none" && auth.Refresh != "cursor-agent"
+}
 func (p *pluginRuntime) refreshAuth(s *requestScope, req rpcRequest) (any, error) {
 	auth, stored, err := storedCredential(req)
 	if err != nil {
 		return nil, err
 	}
-	if auth.Type == "oauth" {
+	now := p.now()
+	expires := auth.Expires
+	if expires == 0 {
+		expires = jwtExpiry(auth.Access)
+	}
+	if renewable(auth) && (auth.Access == "" || expires > 0 && expires-now.UnixMilli() <= refreshLead.Milliseconds()) {
+		if err = checkProxy(req, stored); err != nil {
+			return nil, err
+		}
+		if auth, err = p.renew(s, auth); err != nil {
+			return nil, err
+		}
+		expires = auth.Expires
+	} else if auth.Type == "oauth" && !auth.RefreshStopped {
 		if _, err = p.token(s, req); err != nil {
 			return nil, err
 		}
 	}
 	record := authRecord(auth, req.FileName, str(stored["label"]), stored)
+	// CPA's refresh request does not include FileName or Label. Leave absent
+	// values empty so the host retains them instead of deriving new identities
+	// from a rotated token. Refresh only changes credentials, not account setup.
+	record["FileName"] = req.FileName
+	record["Label"] = str(stored["label"])
 	if req.AuthID != "" {
 		record["ID"] = req.AuthID
 	}
-	return map[string]any{"Auth": record, "NextRefreshAfter": p.now().Add(time.Hour).UTC().Format(time.RFC3339)}, nil
+	next := now.Add(time.Hour)
+	if renewable(auth) && expires > 0 {
+		if due := time.UnixMilli(expires).Add(-refreshLead); due.After(now) && due.Before(next) {
+			next = due
+		}
+	}
+	return map[string]any{"Auth": record, "NextRefreshAfter": next.UTC().Format(time.RFC3339)}, nil
+}
+
+// renew exchanges the stored refresh token for a new access token. An unusable
+// response stops renewal without replacing the current token or disabling the
+// account; request execution will reject the current token once it expires.
+//
+// Browser login stores one session token as both access and refresh token, and renewal
+// returns a new session token without a refresh token. When the stored refresh token is
+// a JWT that expires before the new token, the new token becomes the refresh token too,
+// so renewal does not depend on the original login's expiry.
+func (p *pluginRuntime) renew(s *requestScope, auth credential) (credential, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+	defer cancel()
+	result, err := s.json(ctx, http.MethodPost, "/oauth/token", "", map[string]any{"grant_type": "refresh_token", "client_id": cursorClientID, "refresh_token": auth.Refresh})
+	if err != nil {
+		if errorStatus(err) == http.StatusUnauthorized || errorStatus(err) == http.StatusBadRequest && strings.Contains(err.Error(), "invalid_grant") {
+			auth.RefreshStopped = true
+			return auth, nil
+		}
+		return auth, err
+	}
+	token := str(result["access_token"])
+	expires := jwtExpiry(token)
+	if result["shouldLogout"] == true || token == "" || expires <= p.now().UnixMilli() {
+		auth.RefreshStopped = true
+		return auth, nil
+	}
+	auth.Access = token
+	auth.Expires = expires
+	if refresh := str(result["refresh_token"]); refresh != "" {
+		auth.Refresh = refresh
+	} else if expires := jwtExpiry(auth.Refresh); expires > 0 && auth.Expires > expires {
+		auth.Refresh = token
+	}
+	return auth, nil
 }
 func (p *pluginRuntime) startLogin(s *requestScope, req rpcRequest) (any, error) {
 	now := p.now()

@@ -1,5 +1,25 @@
 # Native version 0.1.1 validation
 
+## Browser renewal follow-up (2026-11-04)
+
+PR #2 adds browser-token renewal through CPA's refresh scheduler. The merged
+implementation preserves enabled/disabled account settings and lets CPA retain
+the existing account filename and label. An empty, malformed, expiry-less or
+expired replacement token, `shouldLogout`, or a rejected refresh grant preserves
+the original credentials and persists `cursor_auth.refreshStopped`. It clears
+the refresh interval and prevents further renewal calls after reload/restart.
+The existing access token remains subject to its original expiry; signing in
+again creates credentials without the stop marker. Temporary server failures
+and rate limits remain errors eligible for later refresh attempts.
+
+Local validation on macOS ARM64 with Go 1.26.0: `go test -race ./...`, `go vet
+./...`, shared-library build, and the C ABI smoke test passed. Regression tests
+cover enabled and disabled accounts with fresh/due tokens, preservation of
+account metadata, invalid renewal responses, restart persistence, no subsequent
+renewal requests, original-token acceptance before expiry and rejection at
+expiry, and temporary server failures. Tests use synthetic credentials and host
+HTTP fixtures; no real Cursor login was used for this follow-up.
+
 ## Store audit follow-up (2026-10-22)
 
 PR #277 was closed because the release lacked Darwin AMD64 and ARM64 binaries.

@@ -217,7 +217,7 @@ func (s *requestScope) json(ctx context.Context, method, path, token string, bod
 		payload = encodeJSON(body)
 	}
 	h := headers(token)
-	if strings.HasPrefix(path, "/auth/") {
+	if strings.HasPrefix(path, "/auth/") || strings.HasPrefix(path, "/oauth/") {
 		h.Del("Connect-Protocol-Version")
 	}
 	resp, err := s.do(ctx, method, url, h, payload)
