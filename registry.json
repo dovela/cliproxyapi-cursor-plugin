@@ -6,7 +6,7 @@
       "name": "Cursor",
       "description": "Cursor provider with browser and API key login, streaming Chat Completions, images, tool calls and quota reporting through CPA host HTTP callbacks.",
       "author": "spx",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "repository": "https://github.com/spancerxing/cliproxyapi-cursor-plugin",
       "homepage": "https://github.com/spancerxing/cliproxyapi-cursor-plugin",
       "license": "MIT",

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 const pluginID = "spx-cursor"
 const pluginLogo = "https://raw.githubusercontent.com/spancerxing/cliproxyapi-cursor-plugin/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
