@@ -28,8 +28,16 @@ type runState struct {
 	tools                                []chatTool
 	blobs                                map[string][]byte
 	seen                                 map[string]string
+	pending                              []map[string]any
 	estimate                             int
 }
+
+// toolBatchWait is how long a step may stay silent after its latest tool call,
+// local answer, or declared count before the batch is abandoned. Cursor sends
+// each call only after its arguments are written, so the wait restarts on each
+// of those. Calls stay buffered until the count seals the batch; a deadline or
+// a stream that ends first drops them instead of handing the caller a partial.
+var toolBatchWait = 30 * time.Second
 
 var maxModeRequired = regexp.MustCompile(`(?i)max[ _]mode[ _]required|requires max mode`)
 
@@ -369,136 +377,265 @@ func usageFromFields(fs []pbField) map[string]any {
 	}
 	return out
 }
-func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(runEvent) bool) error {
-	done := func() bool { return st.listed > 0 && st.calls+st.answered >= st.listed }
-	for {
-		data, end, err := readConnectFrame(reader)
-		if err != nil {
-			if errors.Is(err, io.EOF) && st.calls > 0 {
-				emit(st.finished())
-				return nil
-			}
-			if errors.Is(err, io.EOF) {
-				return failure(502, "Cursor reply broke off before turn completion")
-			}
-			return err
-		}
-		if end {
-			if err = connectError(200, data); err != nil {
-				return err
-			}
-			if st.wrote == 0 && st.calls == 0 {
-				return failure(502, "Cursor returned an empty reply")
-			}
-			emit(st.finished())
-			return nil
-		}
-		fields, err := pbFields(data)
-		if err != nil {
-			return err
-		}
-		for _, field := range fields {
-			switch field.number {
-			case 1:
-				updates, err := pbFields(field.data)
-				if err != nil {
-					return err
-				}
-				for _, update := range updates {
-					fs, err := pbFields(update.data)
-					if err != nil {
-						return err
-					}
-					switch update.number {
-					case 1:
-						text := pbText(fs, 1)
-						st.said += len(text)
-						st.wrote += len(text)
-						if text != "" && !emit(runEvent{text: text}) {
-							return context.Canceled
-						}
-					case 4:
-						text := pbText(fs, 1)
-						st.said += len(text)
-						if text != "" && !emit(runEvent{reasoning: text}) {
-							return context.Canceled
-						}
-					case 14:
-						st.ended = true
-						st.usage = usageFromFields(fs)
-						if st.calls == 0 {
-							if st.wrote == 0 {
-								return failure(502, "Cursor ended a turn without text or tool calls")
-							}
-							emit(st.finished())
-							return nil
-						}
-					case 27:
-						n := pbNum(fs, 1)
-						if f := pbGet(fs, 1); f == nil || f.wire != 0 || n == 0 || n > 100000 {
-							return failure(502, "Invalid Cursor tool batch count")
-						}
-						if st.listed > 0 && st.listed != int(n) {
-							return failure(502, "Conflicting Cursor tool batch counts")
-						}
-						st.listed = int(n)
-					}
-				}
-			case 2:
-				call, counted, err := st.exec(field.data, send)
-				if err != nil {
-					return err
-				}
-				if call != nil {
-					call["index"] = st.calls
-					st.calls++
-					st.said += len(str(object(call["function"])["arguments"]))
-					if !emit(runEvent{tool: call}) {
-						return context.Canceled
-					}
-				} else if counted {
-					st.answered++
-				}
-			case 4:
-				fs, err := pbFields(field.data)
-				if err != nil {
-					return err
-				}
-				id := pbNum(fs, 1)
-				for _, part := range fs {
-					switch part.number {
-					case 2:
-						want, err := pbFields(part.data)
-						if err != nil {
-							return err
-						}
-						key := hex.EncodeToString([]byte(pbText(want, 1)))
-						var result protobuf
-						if blob, ok := st.blobs[key]; ok {
-							result = result.bytes(1, blob)
-						} else {
-							result = result.bytes(2, protobuf(nil).text(1, "blob not found"))
-						}
-						if err = send(protobuf(nil).bytes(3, protobuf(nil).uint(1, id).bytes(2, result))); err != nil {
-							return err
-						}
-					case 3:
-						if err = send(protobuf(nil).bytes(3, protobuf(nil).uint(1, id).bytes(3, nil))); err != nil {
-							return err
-						}
-					}
-				}
-			}
-			if done() {
-				if st.calls > 0 {
-					emit(st.finished())
-					return nil
-				}
-				st.listed = 0
-				st.answered = 0
-			}
+
+type readFrame struct {
+	data []byte
+	end  bool
+	err  error
+}
+
+func (st *runState) batchOpen() bool {
+	made := st.calls + st.answered
+	if made == 0 {
+		return false
+	}
+	return st.listed == 0 || made < st.listed
+}
+func (st *runState) batchIncomplete() error {
+	if st.listed > 0 {
+		return failure(502, "Cursor did not complete its declared tool batch")
+	}
+	return failure(502, "Cursor did not declare its tool batch")
+}
+func (st *runState) publish(emit func(runEvent) bool) error {
+	for _, call := range st.pending {
+		if !emit(runEvent{tool: call}) {
+			return context.Canceled
 		}
 	}
+	st.pending = nil
+	if !emit(st.finished()) {
+		return context.Canceled
+	}
+	return nil
+}
+
+// seal delivers buffered client calls once Cursor's count matches them.
+// A count that covers only calls answered locally lets the turn continue.
+func (st *runState) seal(emit func(runEvent) bool) (bool, error) {
+	made := st.calls + st.answered
+	if st.listed == 0 || made < st.listed {
+		return false, nil
+	}
+	if made > st.listed {
+		return false, failure(502, "Cursor tool batch exceeded its declared count")
+	}
+	if st.calls == 0 {
+		st.listed = 0
+		st.answered = 0
+		return false, nil
+	}
+	if err := st.publish(emit); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(runEvent) bool) error {
+	frames := make(chan readFrame, 1)
+	quit := make(chan struct{})
+	defer close(quit)
+	go func() {
+		for {
+			data, end, err := readConnectFrame(reader)
+			select {
+			case <-quit:
+				return
+			case frames <- readFrame{data: data, end: end, err: err}:
+			}
+			if err != nil || end {
+				return
+			}
+		}
+	}()
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	stopTimer := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerC = nil
+	}
+	defer stopTimer()
+	arm := func() {
+		if !st.batchOpen() {
+			stopTimer()
+			return
+		}
+		if timer == nil {
+			timer = time.NewTimer(toolBatchWait)
+		} else if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+			timer.Reset(toolBatchWait)
+		} else {
+			timer.Reset(toolBatchWait)
+		}
+		timerC = timer.C
+	}
+	for {
+		var frame readFrame
+		expired := false
+		select {
+		case frame = <-frames:
+		case <-timerC:
+			select {
+			case frame = <-frames:
+				expired = true
+			default:
+				return st.batchIncomplete()
+			}
+		}
+		sealed, touched, err := st.consume(frame, send, emit)
+		if err != nil || sealed {
+			return err
+		}
+		if expired && st.batchOpen() {
+			return st.batchIncomplete()
+		}
+		if touched {
+			arm()
+		}
+	}
+}
+func (st *runState) consume(frame readFrame, send func([]byte) error, emit func(runEvent) bool) (bool, bool, error) {
+	if frame.err != nil {
+		if errors.Is(frame.err, io.EOF) && st.batchOpen() {
+			return false, false, st.batchIncomplete()
+		}
+		if errors.Is(frame.err, io.EOF) {
+			return false, false, failure(502, "Cursor reply broke off before turn completion")
+		}
+		return false, false, frame.err
+	}
+	if frame.end {
+		if err := connectError(200, frame.data); err != nil {
+			return false, false, err
+		}
+		if st.batchOpen() {
+			return false, false, st.batchIncomplete()
+		}
+		if st.wrote == 0 && st.calls == 0 {
+			return false, false, failure(502, "Cursor returned an empty reply")
+		}
+		if !emit(st.finished()) {
+			return false, false, context.Canceled
+		}
+		return true, false, nil
+	}
+	fields, err := pbFields(frame.data)
+	if err != nil {
+		return false, false, err
+	}
+	touched := false
+	for _, field := range fields {
+		switch field.number {
+		case 1:
+			updates, err := pbFields(field.data)
+			if err != nil {
+				return false, false, err
+			}
+			for _, update := range updates {
+				fs, err := pbFields(update.data)
+				if err != nil {
+					return false, false, err
+				}
+				switch update.number {
+				case 1:
+					text := pbText(fs, 1)
+					st.said += len(text)
+					st.wrote += len(text)
+					if text != "" && !emit(runEvent{text: text}) {
+						return false, false, context.Canceled
+					}
+				case 4:
+					text := pbText(fs, 1)
+					st.said += len(text)
+					if text != "" && !emit(runEvent{reasoning: text}) {
+						return false, false, context.Canceled
+					}
+				case 14:
+					st.ended = true
+					st.usage = usageFromFields(fs)
+					if st.calls == 0 {
+						if st.wrote == 0 {
+							return false, false, failure(502, "Cursor ended a turn without text or tool calls")
+						}
+						if !emit(st.finished()) {
+							return false, false, context.Canceled
+						}
+						return true, false, nil
+					}
+				case 27:
+					n := pbNum(fs, 1)
+					if f := pbGet(fs, 1); f == nil || f.wire != 0 || n == 0 || n > 100000 {
+						return false, false, failure(502, "Invalid Cursor tool batch count")
+					}
+					if st.listed > 0 && st.listed != int(n) {
+						return false, false, failure(502, "Conflicting Cursor tool batch counts")
+					}
+					st.listed = int(n)
+					touched = true
+				}
+			}
+		case 2:
+			call, counted, err := st.exec(field.data, send)
+			if err != nil {
+				return false, false, err
+			}
+			if call != nil {
+				call["index"] = st.calls
+				st.calls++
+				st.said += len(str(object(call["function"])["arguments"]))
+				st.pending = append(st.pending, call)
+				touched = true
+			} else if counted {
+				st.answered++
+				touched = true
+			}
+		case 4:
+			fs, err := pbFields(field.data)
+			if err != nil {
+				return false, false, err
+			}
+			id := pbNum(fs, 1)
+			for _, part := range fs {
+				switch part.number {
+				case 2:
+					want, err := pbFields(part.data)
+					if err != nil {
+						return false, false, err
+					}
+					key := hex.EncodeToString([]byte(pbText(want, 1)))
+					var result protobuf
+					if blob, ok := st.blobs[key]; ok {
+						result = result.bytes(1, blob)
+					} else {
+						result = result.bytes(2, protobuf(nil).text(1, "blob not found"))
+					}
+					if err = send(protobuf(nil).bytes(3, protobuf(nil).uint(1, id).bytes(2, result))); err != nil {
+						return false, false, err
+					}
+				case 3:
+					if err = send(protobuf(nil).bytes(3, protobuf(nil).uint(1, id).bytes(3, nil))); err != nil {
+						return false, false, err
+					}
+				}
+			}
+		}
+		sealed, err := st.seal(emit)
+		if err != nil || sealed {
+			return sealed, touched, err
+		}
+	}
+	return false, touched, nil
 }
 func (st *runState) exec(data []byte, send func([]byte) error) (map[string]any, bool, error) {
 	fs, err := pbFields(data)
