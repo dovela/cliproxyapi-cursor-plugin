@@ -22,8 +22,9 @@ const cursorAPI = "https://api2.cursor.sh"
 const clientVersion = "cli-2026.09.23-86fc751"
 const maxWireBytes = 64 << 20
 
-// Catalog requests use desktop so Claude Opus stays in the model list.
-// Agent runs stay cli so Cursor keeps the MCP tool protocol this plugin translates.
+// Some Cursor team accounts only list models such as Claude Opus when the
+// catalog client type is desktop. Agent runs stay cli so Cursor keeps the
+// MCP tool protocol this plugin translates.
 const agentClientType = "cli"
 const catalogClientType = "desktop"
 
