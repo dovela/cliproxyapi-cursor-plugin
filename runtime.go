@@ -22,6 +22,12 @@ const cursorAPI = "https://api2.cursor.sh"
 const clientVersion = "cli-2026.09.23-86fc751"
 const maxWireBytes = 64 << 20
 
+// Some Cursor team accounts only list models such as Claude Opus when the
+// catalog client type is desktop. Agent runs stay cli so Cursor keeps the
+// MCP tool protocol this plugin translates.
+const agentClientType = "cli"
+const catalogClientType = "desktop"
+
 type hostCaller func(string, []byte) ([]byte, error)
 type rpcError struct {
 	Code       string `json:"code"`
@@ -276,7 +282,10 @@ func jwtExpiry(token string) int64 {
 	return int64(num(m["exp"]) * 1000)
 }
 func headers(token string) http.Header {
-	h := http.Header{"Content-Type": {"application/json"}, "Connect-Protocol-Version": {"1"}, "X-Cursor-Client-Version": {clientVersion}, "X-Cursor-Client-Type": {"cli"}, "X-Ghost-Mode": {"true"}}
+	return headersWithType(token, agentClientType)
+}
+func headersWithType(token, clientType string) http.Header {
+	h := http.Header{"Content-Type": {"application/json"}, "Connect-Protocol-Version": {"1"}, "X-Cursor-Client-Version": {clientVersion}, "X-Cursor-Client-Type": {clientType}, "X-Ghost-Mode": {"true"}}
 	if token != "" {
 		h.Set("Authorization", "Bearer "+token)
 	}

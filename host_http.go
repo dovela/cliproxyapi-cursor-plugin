@@ -208,6 +208,9 @@ func (b *hostBody) Close() error {
 	return nil
 }
 func (s *requestScope) json(ctx context.Context, method, path, token string, body any) (map[string]any, error) {
+	return s.jsonClient(ctx, method, path, token, body, agentClientType)
+}
+func (s *requestScope) jsonClient(ctx context.Context, method, path, token string, body any, clientType string) (map[string]any, error) {
 	url := path
 	if len(path) > 0 && path[0] == '/' {
 		url = cursorAPI + path
@@ -216,7 +219,7 @@ func (s *requestScope) json(ctx context.Context, method, path, token string, bod
 	if body != nil {
 		payload = encodeJSON(body)
 	}
-	h := headers(token)
+	h := headersWithType(token, clientType)
 	if strings.HasPrefix(path, "/auth/") || strings.HasPrefix(path, "/oauth/") {
 		h.Del("Connect-Protocol-Version")
 	}
