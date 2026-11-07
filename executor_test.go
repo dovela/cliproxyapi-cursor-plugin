@@ -9,10 +9,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestExecutorChatCompletionsFormatCompatibility(t *testing.T) {
@@ -39,9 +41,16 @@ func testUint(field int, n uint64) []byte {
 	return binary.AppendUvarint(binary.AppendUvarint(nil, uint64(field<<3)), n)
 }
 func testToolFrame(name, provider, server string, args []byte) []byte {
-	argument := bytes.Join([][]byte{wireBytes(1, []byte("magpie-"+name)), wireBytes(2, append(wireBytes(1, []byte("path")), wireBytes(2, args)...)), wireBytes(3, []byte("call_fixture")), wireBytes(4, []byte(provider)), wireBytes(5, []byte(name)), wireBytes(9, []byte(server))}, nil)
-	exec := append(append(testUint(1, 7), wireBytes(15, []byte("exec-7"))...), wireBytes(11, argument)...)
+	return testToolFrameN(7, name, provider, server, args)
+}
+func testToolFrameN(id int, name, provider, server string, args []byte) []byte {
+	label := fmt.Sprintf("call_fixture_%d", id)
+	argument := bytes.Join([][]byte{wireBytes(1, []byte("magpie-"+name)), wireBytes(2, append(wireBytes(1, []byte("path")), wireBytes(2, args)...)), wireBytes(3, []byte(label)), wireBytes(4, []byte(provider)), wireBytes(5, []byte(name)), wireBytes(9, []byte(server))}, nil)
+	exec := append(append(testUint(1, uint64(id)), wireBytes(15, []byte(fmt.Sprintf("exec-%d", id)))...), wireBytes(11, argument)...)
 	return wireFrame(wireBytes(2, exec), 0)
+}
+func testBatchCount(n uint64) []byte {
+	return wireFrame(wireBytes(1, wireBytes(27, testUint(1, n))), 0)
 }
 func TestNativeToolDecodingAndAuthority(t *testing.T) {
 	for _, name := range []string{"read", "unknown"} {
@@ -81,6 +90,66 @@ func TestNativeToolDecodingAndAuthority(t *testing.T) {
 			})
 		}
 	}
+}
+func TestToolBatchIsHeldUntilCursorDeclaresIt(t *testing.T) {
+	previous := toolBatchWait
+	toolBatchWait = 250 * time.Millisecond
+	t.Cleanup(func() { toolBatchWait = previous })
+	args := wireBytes(3, []byte("a.txt"))
+	t.Run("declared count releases every call", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		go func() {
+			_, _ = writer.Write(testToolFrameN(7, "read", "magpie", "magpie", args))
+			time.Sleep(25 * time.Millisecond)
+			_, _ = writer.Write(testToolFrameN(8, "read", "magpie", "magpie", args))
+			time.Sleep(25 * time.Millisecond)
+			_, _ = writer.Write(testBatchCount(2))
+			_ = writer.Close()
+		}()
+		var events []runEvent
+		state := runState{tools: []chatTool{{Name: "read"}}, seen: map[string]string{}, estimate: 4}
+		err := state.decode(reader, func([]byte) error { return nil }, func(ev runEvent) bool { events = append(events, ev); return true })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 3 || events[0].tool == nil || events[1].tool == nil || events[2].stop != "tool_calls" {
+			t.Fatalf("batch was not released together: %+v", events)
+		}
+	})
+	t.Run("silence drops the call", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer writer.Close()
+		go func() {
+			_, _ = writer.Write(testToolFrameN(7, "glob", "magpie", "magpie", nil))
+		}()
+		published := false
+		state := runState{tools: []chatTool{{Name: "glob"}}, seen: map[string]string{}}
+		err := state.decode(reader, func([]byte) error { return nil }, func(runEvent) bool { published = true; return true })
+		if err == nil || !strings.Contains(err.Error(), "did not declare") || published {
+			t.Fatalf("silent batch was delivered: err=%v published=%v", err, published)
+		}
+	})
+	t.Run("eof before the count drops the call", func(t *testing.T) {
+		published := false
+		state := runState{tools: []chatTool{{Name: "glob"}}, seen: map[string]string{}}
+		err := state.decode(bytes.NewReader(testToolFrameN(7, "glob", "magpie", "magpie", nil)), func([]byte) error { return nil }, func(runEvent) bool { published = true; return true })
+		if err == nil || !strings.Contains(err.Error(), "did not declare") || published {
+			t.Fatalf("undeclared eof batch was delivered: err=%v published=%v", err, published)
+		}
+	})
+	t.Run("short count is not a partial delivery", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer writer.Close()
+		go func() {
+			_, _ = writer.Write(append(testToolFrameN(7, "read", "magpie", "magpie", args), testBatchCount(2)...))
+		}()
+		published := false
+		state := runState{tools: []chatTool{{Name: "read"}}, seen: map[string]string{}}
+		err := state.decode(reader, func([]byte) error { return nil }, func(runEvent) bool { published = true; return true })
+		if err == nil || !strings.Contains(err.Error(), "did not complete") || published {
+			t.Fatalf("partial batch was delivered: err=%v published=%v", err, published)
+		}
+	})
 }
 func TestNativeMalformedToolArgumentsNeverPublishCalls(t *testing.T) {
 	for _, argument := range [][]byte{{0x1a, 0x05, 'x'}, {0x18, 0x01}, {0x1a, 0x01, 0xff}, {0x08, 0x02}} {
