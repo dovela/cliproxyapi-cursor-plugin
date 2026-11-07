@@ -329,7 +329,7 @@ func buildRun(conv chatConversation, tools []chatTool, model modelResolution, id
 	mid := randomID()
 	user := protobuf(nil).text(1, conv.Last).text(2, mid).uint(4, 1)
 	turn := protobuf(nil).bytes(1, protobuf(nil).bytes(1, put(user)).text(10, mid))
-	state = state.bytes(8, put(turn)).uint(10, 1).text(22, "cli")
+	state = state.bytes(8, put(turn)).uint(10, 1).text(22, agentClientType)
 	rc := protobuf(nil).bytes(4, cursorEnvironment())
 	var mcp protobuf
 	for _, t := range tools {

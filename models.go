@@ -277,10 +277,10 @@ func (p *pluginRuntime) catalog(s *requestScope, token string) ([]modelEntry, er
 	var usableErr error
 	ready := make(chan struct{})
 	go func() {
-		usable, usableErr = s.json(s.ctx, http.MethodPost, "/agent.v1.AgentService/GetUsableModels", token, map[string]any{})
+		usable, usableErr = s.jsonClient(s.ctx, http.MethodPost, "/agent.v1.AgentService/GetUsableModels", token, map[string]any{}, catalogClientType)
 		close(ready)
 	}()
-	picker, err := s.json(s.ctx, http.MethodPost, "/aiserver.v1.AiService/AvailableModels", token, map[string]any{"useModelParameters": true, "doNotUseMarkdown": true})
+	picker, err := s.jsonClient(s.ctx, http.MethodPost, "/aiserver.v1.AiService/AvailableModels", token, map[string]any{"useModelParameters": true, "doNotUseMarkdown": true}, catalogClientType)
 	<-ready
 	if err != nil {
 		return nil, err
